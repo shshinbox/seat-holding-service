@@ -1,0 +1,25 @@
+spring:
+  application:
+    name: seat-holding-service
+  data:
+    redis:
+      host: 192.168.0.37
+      port: 6379
+  kafka:
+    bootstrap-servers: 192.168.0.37:9092
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        spring.json.add.type.headers: false
+
+seat-holding:
+  hold-ttl-seconds: 600
+  lock-wait-seconds: 1
+  lock-lease-seconds: 3
+  kafka:
+    topic: seat-hold-events
+  outbox:
+    pending-key: seat-holding:outbox:pending
+    processing-key: seat-holding:outbox:processing
+    poll-delay-ms: 1000
