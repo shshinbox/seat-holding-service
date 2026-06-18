@@ -14,56 +14,53 @@ import org.springframework.web.bind.annotation.RequestMapping
 import org.springframework.web.bind.annotation.RequestParam
 import org.springframework.web.bind.annotation.ResponseStatus
 import org.springframework.web.bind.annotation.RestController
-import reactor.core.publisher.Mono
 
 @RestController
-@RequestMapping("/venues/{venueId}/seats/{seatId}/holds")
+@RequestMapping("/schedules/{scheduleId}/seats/{seatId}/holds")
 class SeatHoldController(
     private val seatHoldService: SeatHoldService,
 ) {
     @PostMapping
     @ResponseStatus(HttpStatus.CREATED)
-    fun hold(
+    suspend fun hold(
         @PathVariable
-        venueId: String,
+        scheduleId: String,
         @PathVariable
         seatId: String,
         @RequestBody request: SeatHoldRequest,
-    ): Mono<SeatHoldResponse> =
+    ): SeatHoldResponse =
         seatHoldService.hold(
             SeatHoldCommand(
-                venueId = venueId,
+                scheduleId = scheduleId,
                 seatId = seatId,
                 userId = request.userId,
             ),
-        ).map {
+        ).let {
             SeatHoldResponse(
                 holdId = it.holdId,
-                venueId = it.venueId,
+                scheduleId = it.scheduleId,
                 seatId = it.seatId,
                 userId = it.userId,
                 expiresAt = it.expiresAt,
             )
         }
 
-    @DeleteMapping("/{holdId}")
+    @DeleteMapping
     @ResponseStatus(HttpStatus.NO_CONTENT)
-    fun release(
+    suspend fun release(
         @PathVariable
-        venueId: String,
+        scheduleId: String,
         @PathVariable
         seatId: String,
-        @PathVariable
-        holdId: String,
         @RequestParam
         userId: String,
-    ): Mono<Unit> =
+    ) {
         seatHoldService.release(
             SeatHoldReleaseCommand(
-                venueId = venueId,
+                scheduleId = scheduleId,
                 seatId = seatId,
-                holdId = holdId,
                 userId = userId,
             ),
         )
+    }
 }
