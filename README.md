@@ -1,28 +1,44 @@
 # Seat Holding Service
 
-공연/이벤트 좌석을 짧은 시간 동안 선점하는 서비스입니다.
+콘서트 좌석을 선점하고, 사용자가 예약하기를 확정했을 때 선점 좌석 목록을 Kafka로 발행하는 서비스입니다.
 
-클라이언트가 좌석을 클릭하면 Redis에 선점 상태를 저장하고, 선점 성공/해제 이벤트를 Kafka로 발행합니다. 같은 유저는 하나의 스케줄에서 최대 4개 좌석까지만 동시에 선점할 수 있습니다.
+클라이언트의 좌석 클릭은 Redis 선점 상태만 변경합니다. Kafka 이벤트는 좌석 클릭 시점이 아니라 예약하기 버튼을 눌러 confirm API를 호출할 때 발행됩니다.
 
 ## 기술 스택
 
 - Kotlin
 - Spring Boot WebFlux
 - Kotlin Coroutines
-- Redis
+- Reactive Redis
 - Redis Lua Script
 - Kafka Producer
 - Gradle
 
-## 핵심 정책
+## 정책
 
-- 좌석 선점 TTL은 10분입니다.
-- 한 유저는 같은 `scheduleId`에서 최대 4개 좌석까지만 선점할 수 있습니다.
+- 좌석 선점 TTL은 600초입니다.
+- 같은 사용자는 하나의 `scheduleId`에서 최대 4개 좌석까지 선점할 수 있습니다.
 - 이미 판매된 좌석은 선점할 수 없습니다.
-- 이미 다른 요청이 선점한 좌석은 선점할 수 없습니다.
-- 좌석 재클릭은 선점 해제로 처리합니다.
-- 판매 완료 상태는 이 서비스가 직접 만들지 않습니다. 예약/결제 확정 흐름에서 `seat:sold:*` 키를 생성한다고 가정합니다.
-- Redis 선점 성공 후 Kafka 발행이 실패해도 API는 성공으로 유지하고 에러 로그만 남깁니다. 강한 발행 보장은 추후 outbox 도입으로 보완합니다.
+- 다른 사용자가 선점 중인 좌석은 선점할 수 없습니다.
+- 같은 사용자가 이미 선점한 좌석을 다시 클릭하면 선점이 취소됩니다.
+- 예약하기 confirm API 엔드포인트에서 Kafka 이벤트를 발행합니다.
+- API의 사용자 식별자는 `X-Authenticated-User-Id` 헤더에서 resolver로 추출합니다.
+
+## 인증 사용자
+
+모든 API는 다음 헤더가 필요합니다.
+
+```http
+X-Authenticated-User-Id: user-1
+```
+
+헤더가 없거나 blank이면 `401 Unauthorized`를 반환합니다.
+
+```json
+{
+  "message": "X-Authenticated-User-Id header is required."
+}
+```
 
 ## Redis 키
 
@@ -46,79 +62,81 @@ user:holds:{schedule-1}:user-1
 
 판매 완료 좌석입니다.
 
-- TTL 없음
-- 예약/결제 확정 흐름에서 생성
-- 이 키가 있으면 선점 요청은 `409 Conflict`
+- TTL 없음 (혹은 공연 완료 이후로 설정)
+- 예약/결제 확정 흐름에서 생성된다고 가정합니다.
 
 ### `seat:hold:{scheduleId}:{seatId}`
 
 선점 중인 좌석입니다.
 
 - TTL 600초
-- 값은 `holdId`, `scheduleId`, `seatId`, `userId`, `expiresAt`, `occurredAt`을 포함한 JSON
-- 이 키가 있으면 선점 요청은 `409 Conflict`
+- 값은 `holdId`, `scheduleId`, `seatId`, `userId`, `expiresAt`, `occurredAt`을 포함한 JSON입니다.
+- 다른 사용자의 hold가 존재하면 좌석 클릭 API는 `409 Conflict`를 반환합니다.
+- 같은 사용자의 hold가 존재하면 좌석 클릭 API는 해당 hold를 삭제하고 `RELEASED` 상태를 반환합니다.
 
 ### `user:holds:{scheduleId}:{userId}`
 
-유저가 현재 선점 중인 좌석 목록입니다.
+사용자별 동시 선점 수를 Redis Lua script 안에서 원자적으로 검증하기 위한 보조 인덱스입니다.
 
 - Redis Set
-- seatId들을 저장
+- 사용자가 선점 시도에 성공한 `seatId` 묶음을 저장합니다.
 - TTL 600초
-- Lua script 실행 시 실제 `seat:hold:*` 존재 여부를 확인하며 만료된 좌석은 Set에서 제거합니다.
 
-## 선점 흐름
+
+## 좌석 클릭 흐름
 
 ```text
 POST /schedules/{scheduleId}/seats/{seatId}/holds
-  -> SeatHoldController
-  -> SeatHoldService
+  -> AuthenticatedUserArgumentResolver
+      1. X-Authenticated-User-Id 헤더에서 userId 추출
+  -> SeatHoldController.toggle
+  -> SeatHoldService.toggle
   -> Redis Lua script
       1. sold key 존재 확인
       2. hold key 존재 확인
-      3. user:holds Set 정리
-      4. 현재 유저 active hold 수 확인
-      5. 최대 4개 제한 확인
-      6. seat:hold key 생성 + TTL 설정
-      7. user:holds Set 추가 + TTL 설정
-  -> Kafka SEAT_HELD 이벤트 발행
+      3. 같은 user의 hold이면 seat:hold 삭제 + user:holds에서 제거
+      4. 다른 user의 hold이면 conflict
+      5. user:holds Set에서 만료된 seatId 정리
+      6. 현재 user active hold 개수 확인
+      7. 최대 4개 제한 확인
+      8. 이번 seatId의 seat:hold key 생성 + TTL 설정
+      9. 이번 seatId를 user:holds Set에 추가 + TTL 설정
   -> API 응답
 ```
 
-Redis Lua script 안에서 좌석 상태 확인과 선점 생성이 한 번에 처리됩니다.
+좌석 클릭 API는 Kafka 이벤트를 발행하지 않습니다.
 
-## 선점 해제 흐름
+## 예약하기 confirm 흐름
 
 ```text
-DELETE /schedules/{scheduleId}/seats/{seatId}/holds?userId={userId}
-  -> SeatHoldController
-  -> SeatHoldService
-  -> Redis Lua script
-      1. seat:hold key 조회
-      2. hold가 없으면 user:holds에서 seatId 제거 후 성공 처리
-      3. hold가 있으면 userId 소유권 확인
-      4. 소유자가 다르면 409 Conflict
-      5. seat:hold 삭제
-      6. user:holds에서 seatId 제거
-  -> Kafka SEAT_HOLD_RELEASED 이벤트 발행
+POST /schedules/{scheduleId}/holds/confirm
+  -> AuthenticatedUserArgumentResolver
+      1. X-Authenticated-User-Id 헤더에서 userId 추출
+  -> SeatHoldController.confirm
+  -> SeatHoldService.confirm
+  -> Redis
+      1. user:holds:{scheduleId}:{userId} 조회
+      2. 실제 seat:hold:* 키가 살아있는 좌석만 필터링
+      3. 만료되었거나 다른 user의 hold는 user:holds Set에서 정리
+  -> Kafka SEAT_HOLD_CONFIRMED 이벤트 발행
+  -> API 응답
 ```
 
-hold가 이미 만료된 좌석에 대한 해제 요청은 성공 처리합니다.
+confirm 시점에 살아있는 hold 좌석이 없으면 `404 Not Found`를 반환합니다.
 
 ## API
 
-### 좌석 선점
+### 좌석 클릭 토글
+
+좌석을 클릭하면 hold 또는 release 중 하나로 처리됩니다.
 
 ```http
 POST /schedules/{scheduleId}/seats/{seatId}/holds
-Content-Type: application/json
-
-{
-  "userId": "user-1"
-}
+X-Authenticated-User-Id: user-1
 ```
 
-성공 응답:
+
+hold 생성 응답:
 
 ```http
 201 Created
@@ -130,11 +148,29 @@ Content-Type: application/json
   "scheduleId": "schedule-1",
   "seatId": "A-1",
   "userId": "user-1",
-  "expiresAt": "2026-06-18T12:10:00Z"
+  "status": "HELD",
+  "expiresAt": "2026-06-23T12:10:00Z"
 }
 ```
 
-실패 응답:
+같은 사용자가 다시 클릭해 hold를 취소한 응답:
+
+```http
+200 OK
+```
+
+```json
+{
+  "holdId": null,
+  "scheduleId": "schedule-1",
+  "seatId": "A-1",
+  "userId": "user-1",
+  "status": "RELEASED",
+  "expiresAt": null
+}
+```
+
+주요 실패 응답:
 
 ```http
 409 Conflict
@@ -146,28 +182,47 @@ Content-Type: application/json
 }
 ```
 
-주요 실패 케이스:
+실패 케이스:
 
 - 이미 판매된 좌석
-- 이미 선점된 좌석
-- 유저의 동시 선점 좌석 수가 4개 이상
+- 다른 사용자가 선점 중인 좌석
+- 사용자의 동시 선점 좌석 수가 4개 이상
 
-### 좌석 선점 해제
+### 예약하기 confirm
+
+현재 사용자가 선점 중인 좌석 목록을 Kafka로 발행합니다.
 
 ```http
-DELETE /schedules/{scheduleId}/seats/{seatId}/holds?userId=user-1
+POST /schedules/{scheduleId}/holds/confirm
+X-Authenticated-User-Id: user-1
 ```
 
 성공 응답:
 
 ```http
-204 No Content
+200 OK
 ```
 
-다른 유저가 선점한 좌석을 해제하려 하면:
+```json
+{
+  "confirmationId": "confirmation-uuid",
+  "scheduleId": "schedule-1",
+  "seatIds": ["A-1", "A-2"],
+  "userId": "user-1",
+  "occurredAt": "2026-06-23T12:00:00Z"
+}
+```
+
+선점 중인 좌석이 없으면:
 
 ```http
-409 Conflict
+404 Not Found
+```
+
+```json
+{
+  "message": "No seat holds to confirm. scheduleId=schedule-1, userId=user-1"
+}
 ```
 
 ## Kafka 이벤트
@@ -186,34 +241,22 @@ seat-holding:
     topic: seat-hold-events
 ```
 
-### `SEAT_HELD`
+현재 실제 발행되는 이벤트는 confirm API에서 발행하는 `SEAT_HOLD_CONFIRMED`입니다.
+
+### `SEAT_HOLD_CONFIRMED`
 
 ```json
 {
   "eventId": "event-uuid",
-  "eventType": "SEAT_HELD",
-  "holdId": "hold-uuid",
+  "eventType": "SEAT_HOLD_CONFIRMED",
+  "holdId": "confirmation-uuid",
   "scheduleId": "schedule-1",
-  "seatId": "A-1",
-  "userId": "user-1",
-  "expiresAt": "2026-06-18T12:10:00Z",
-  "occurredAt": "2026-06-18T12:00:00Z",
-  "schemaVersion": 1
-}
-```
-
-### `SEAT_HOLD_RELEASED`
-
-```json
-{
-  "eventId": "event-uuid",
-  "eventType": "SEAT_HOLD_RELEASED",
-  "holdId": "hold-uuid",
-  "scheduleId": "schedule-1",
-  "seatId": "A-1",
+  "seatIds": ["A-1", "A-2"],
   "userId": "user-1",
   "expiresAt": null,
-  "occurredAt": "2026-06-18T12:01:00Z",
-  "schemaVersion": 1
+  "occurredAt": "2026-06-23T12:00:00Z",
+  "schemaVersion": 2
 }
 ```
+
+`seatIds`는 confirm 시점에 살아있는 hold 좌석만 포함합니다. Redis Set은 순서를 보장하지 않기 때문에 서비스에서 정렬 후 발행합니다.

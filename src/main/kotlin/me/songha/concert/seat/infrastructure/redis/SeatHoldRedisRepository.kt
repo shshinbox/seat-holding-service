@@ -15,13 +15,20 @@ class SeatHoldRedisRepository(
     private val objectMapper: ObjectMapper,
     @Value("\${seat-holding.max-holds-per-user}") private val maxHoldsPerUser: Int,
 ) {
-    private val holdScript = RedisScript.of(
+    private val toggleScript = RedisScript.of(
         """
         if redis.call('EXISTS', KEYS[1]) == 1 then
           return 'SOLD'
         end
         
-        if redis.call('EXISTS', KEYS[2]) == 1 then
+        local current = redis.call('GET', KEYS[2])
+        if current then
+          local hold = cjson.decode(current)
+          if hold.userId == ARGV[2] then
+            redis.call('DEL', KEYS[2])
+            redis.call('SREM', KEYS[3], ARGV[3])
+            return 'HELD_RELEASED'
+          end
           return 'HELD'
         end
         
@@ -47,31 +54,35 @@ class SeatHoldRedisRepository(
         """.trimIndent(),
         String::class.java,
     )
-    private val releaseScript = RedisScript.of(
+    private val activeHoldsScript = RedisScript.of(
         """
-        local current = redis.call('GET', KEYS[1])
-        if not current then
-          redis.call('SREM', KEYS[2], ARGV[2])
-          return 'NOOP'
+        local heldSeatIds = redis.call('SMEMBERS', KEYS[1])
+        local activeHolds = {}
+        
+        for _, heldSeatId in ipairs(heldSeatIds) do
+          local activeHoldKey = 'seat:hold:{' .. ARGV[1] .. '}:' .. heldSeatId
+          local current = redis.call('GET', activeHoldKey)
+          if current then
+            local hold = cjson.decode(current)
+            if hold.userId == ARGV[2] then
+              table.insert(activeHolds, hold)
+            else
+              redis.call('SREM', KEYS[1], heldSeatId)
+            end
+          else
+            redis.call('SREM', KEYS[1], heldSeatId)
+          end
         end
         
-        local hold = cjson.decode(current)
-        if hold.userId ~= ARGV[1] then
-          return 'DENIED'
-        end
-        
-        redis.call('DEL', KEYS[1])
-        redis.call('SREM', KEYS[2], ARGV[2])
-        return 'RELEASED:' .. hold.holdId
+        return cjson.encode(activeHolds)
         """.trimIndent(),
         String::class.java,
     )
-
-    suspend fun hold(result: SeatHoldResult, ttl: Duration): SeatHoldRedisHoldResult {
+    suspend fun toggle(result: SeatHoldResult, ttl: Duration): SeatHoldRedisToggleResult {
         val holdJson = objectMapper.writeValueAsString(result)
 
         return redisTemplate.execute(
-            holdScript,
+            toggleScript,
             listOf(
                 soldKey(result.scheduleId, result.seatId),
                 holdKey(result.scheduleId, result.seatId),
@@ -85,19 +96,23 @@ class SeatHoldRedisRepository(
                 maxHoldsPerUser.toString(),
                 ttl.seconds.toString(),
             ),
-        ).next().map { SeatHoldRedisHoldResult.valueOf(it) }.awaitSingle()
+        ).next().map {
+            when (it) {
+                "HELD" -> SeatHoldRedisToggleResult.HELD_BY_ANOTHER_USER
+                else -> SeatHoldRedisToggleResult.valueOf(it)
+            }
+        }.awaitSingle()
     }
 
-    suspend fun release(
-        scheduleId: String,
-        seatId: String,
-        userId: String,
-    ): SeatHoldRedisReleaseResult =
-        redisTemplate.execute(
-            releaseScript,
-            listOf(holdKey(scheduleId, seatId), userHoldsKey(scheduleId, userId)),
-            listOf(userId, seatId),
-        ).next().map { SeatHoldRedisReleaseResult.fromScriptResult(it) }.awaitSingle()
+    suspend fun findActiveHolds(scheduleId: String, userId: String): List<SeatHoldResult> {
+        val json = redisTemplate.execute(
+            activeHoldsScript,
+            listOf(userHoldsKey(scheduleId, userId)),
+            listOf(scheduleId, userId),
+        ).next().awaitSingle()
+
+        return objectMapper.readValue(json, Array<SeatHoldResult>::class.java).toList()
+    }
 
     private fun soldKey(scheduleId: String, seatId: String): String =
         "seat:sold:{$scheduleId}:$seatId"

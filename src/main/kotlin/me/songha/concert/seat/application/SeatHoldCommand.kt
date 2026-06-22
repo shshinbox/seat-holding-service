@@ -6,8 +6,7 @@ data class SeatHoldCommand(
     val userId: String,
 )
 
-data class SeatHoldReleaseCommand(
+data class SeatHoldConfirmCommand(
     val scheduleId: String,
-    val seatId: String,
     val userId: String,
 )

@@ -9,5 +9,5 @@ class SeatAlreadyHeldException(scheduleId: String, seatId: String) :
 class UserHoldLimitExceededException(scheduleId: String, userId: String) :
     RuntimeException("User hold limit exceeded. scheduleId=$scheduleId, userId=$userId")
 
-class SeatHoldReleaseNotAllowedException(scheduleId: String, seatId: String) :
-    RuntimeException("Seat hold release is not allowed. scheduleId=$scheduleId, seatId=$seatId")
+class NoSeatHoldsToConfirmException(scheduleId: String, userId: String) :
+    RuntimeException("No seat holds to confirm. scheduleId=$scheduleId, userId=$userId")

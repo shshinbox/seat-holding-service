@@ -1,36 +1,40 @@
 package me.songha.concert.seat.infrastructure.kafka
 
-import me.songha.concert.seat.application.SeatHoldResult
 import java.time.Instant
-import java.util.UUID
+import java.util.*
 
 data class SeatHoldEvent(
     val eventId: String,
     val eventType: SeatHoldEventType,
     val holdId: String,
     val scheduleId: String,
-    val seatId: String,
+    val seatIds: List<String>,
     val userId: String,
     val expiresAt: Instant?,
     val occurredAt: Instant,
-    val schemaVersion: Int = 1,
+    val schemaVersion: Int = 2,
 ) {
     companion object {
-        fun held(result: SeatHoldResult): SeatHoldEvent =
+        fun confirmed(
+            confirmationId: String,
+            scheduleId: String,
+            seatIds: List<String>,
+            userId: String,
+            occurredAt: Instant,
+        ): SeatHoldEvent =
             SeatHoldEvent(
                 eventId = UUID.randomUUID().toString(),
-                eventType = SeatHoldEventType.SEAT_HELD,
-                holdId = result.holdId,
-                scheduleId = result.scheduleId,
-                seatId = result.seatId,
-                userId = result.userId,
-                expiresAt = result.expiresAt,
-                occurredAt = result.occurredAt,
+                eventType = SeatHoldEventType.SEAT_HOLD_CONFIRMED,
+                holdId = confirmationId,
+                scheduleId = scheduleId,
+                seatIds = seatIds,
+                userId = userId,
+                expiresAt = null,
+                occurredAt = occurredAt,
             )
     }
 }
 
 enum class SeatHoldEventType {
-    SEAT_HELD,
-    SEAT_HOLD_RELEASED,
+    SEAT_HOLD_CONFIRMED,
 }

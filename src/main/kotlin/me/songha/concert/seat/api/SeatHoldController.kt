@@ -1,66 +1,72 @@
 package me.songha.concert.seat.api
 
-import me.songha.concert.seat.api.request.SeatHoldRequest
-import me.songha.concert.seat.api.response.SeatHoldResponse
+import me.songha.concert.seat.api.auth.AuthenticatedUser
+import me.songha.concert.seat.api.dto.SeatHoldConfirmResponse
+import me.songha.concert.seat.api.dto.SeatHoldToggleResponse
 import me.songha.concert.seat.application.SeatHoldCommand
-import me.songha.concert.seat.application.SeatHoldReleaseCommand
+import me.songha.concert.seat.application.SeatHoldConfirmCommand
 import me.songha.concert.seat.application.SeatHoldService
+import me.songha.concert.seat.application.SeatHoldToggleStatus
 import org.springframework.http.HttpStatus
-import org.springframework.web.bind.annotation.DeleteMapping
-import org.springframework.web.bind.annotation.PathVariable
-import org.springframework.web.bind.annotation.PostMapping
-import org.springframework.web.bind.annotation.RequestBody
-import org.springframework.web.bind.annotation.RequestMapping
-import org.springframework.web.bind.annotation.RequestParam
-import org.springframework.web.bind.annotation.ResponseStatus
-import org.springframework.web.bind.annotation.RestController
+import org.springframework.http.ResponseEntity
+import org.springframework.web.bind.annotation.*
 
 @RestController
-@RequestMapping("/schedules/{scheduleId}/seats/{seatId}/holds")
+@RequestMapping("/schedules/{scheduleId}")
 class SeatHoldController(
     private val seatHoldService: SeatHoldService,
 ) {
-    @PostMapping
-    @ResponseStatus(HttpStatus.CREATED)
-    suspend fun hold(
+    @PostMapping("/seats/{seatId}/holds")
+    suspend fun toggle(
         @PathVariable
         scheduleId: String,
         @PathVariable
         seatId: String,
-        @RequestBody request: SeatHoldRequest,
-    ): SeatHoldResponse =
-        seatHoldService.hold(
+        authenticatedUser: AuthenticatedUser,
+    ): ResponseEntity<SeatHoldToggleResponse> =
+        seatHoldService.toggle(
             SeatHoldCommand(
                 scheduleId = scheduleId,
                 seatId = seatId,
-                userId = request.userId,
+                userId = authenticatedUser.id,
             ),
         ).let {
-            SeatHoldResponse(
-                holdId = it.holdId,
-                scheduleId = it.scheduleId,
-                seatId = it.seatId,
-                userId = it.userId,
-                expiresAt = it.expiresAt,
+            val status = if (it.status == SeatHoldToggleStatus.HELD) {
+                HttpStatus.CREATED
+            } else {
+                HttpStatus.OK
+            }
+
+            ResponseEntity.status(status).body(
+                SeatHoldToggleResponse(
+                    holdId = it.holdId,
+                    scheduleId = it.scheduleId,
+                    seatId = it.seatId,
+                    userId = it.userId,
+                    status = it.status,
+                    expiresAt = it.expiresAt,
+                ),
             )
         }
 
-    @DeleteMapping
-    @ResponseStatus(HttpStatus.NO_CONTENT)
-    suspend fun release(
+    @PostMapping("/holds/confirm")
+    suspend fun confirm(
         @PathVariable
         scheduleId: String,
-        @PathVariable
-        seatId: String,
-        @RequestParam
-        userId: String,
-    ) {
-        seatHoldService.release(
-            SeatHoldReleaseCommand(
+        authenticatedUser: AuthenticatedUser,
+    ): SeatHoldConfirmResponse =
+        seatHoldService.confirm(
+            SeatHoldConfirmCommand(
                 scheduleId = scheduleId,
-                seatId = seatId,
-                userId = userId,
+                userId = authenticatedUser.id,
             ),
-        )
-    }
+        ).let {
+            SeatHoldConfirmResponse(
+                confirmationId = it.confirmationId,
+                scheduleId = it.scheduleId,
+                seatIds = it.seatIds,
+                userId = it.userId,
+                occurredAt = it.occurredAt,
+            )
+        }
 }

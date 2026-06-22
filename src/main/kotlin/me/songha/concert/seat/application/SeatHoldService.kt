@@ -2,10 +2,8 @@ package me.songha.concert.seat.application
 
 import me.songha.concert.seat.infrastructure.kafka.SeatHoldEvent
 import me.songha.concert.seat.infrastructure.kafka.SeatHoldEventProducer
-import me.songha.concert.seat.infrastructure.kafka.SeatHoldEventType
-import me.songha.concert.seat.infrastructure.redis.SeatHoldRedisHoldResult
-import me.songha.concert.seat.infrastructure.redis.SeatHoldRedisReleaseResult
 import me.songha.concert.seat.infrastructure.redis.SeatHoldRedisRepository
+import me.songha.concert.seat.infrastructure.redis.SeatHoldRedisToggleResult
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.stereotype.Service
@@ -21,7 +19,7 @@ class SeatHoldService(
 ) {
     private val log = LoggerFactory.getLogger(javaClass)
 
-    suspend fun hold(command: SeatHoldCommand): SeatHoldResult {
+    suspend fun toggle(command: SeatHoldCommand): SeatHoldToggleResult {
         val now = Instant.now()
         val result = SeatHoldResult(
             holdId = UUID.randomUUID().toString(),
@@ -32,43 +30,55 @@ class SeatHoldService(
             occurredAt = now,
         )
 
-        return when (seatHoldRedisRepository.hold(result, Duration.ofSeconds(holdTtlSeconds))) {
-            SeatHoldRedisHoldResult.HELD_CREATED -> {
-                publish(SeatHoldEvent.held(result))
-                result
-            }
-            SeatHoldRedisHoldResult.SOLD -> throw SeatAlreadySoldException(command.scheduleId, command.seatId)
-            SeatHoldRedisHoldResult.HELD -> throw SeatAlreadyHeldException(command.scheduleId, command.seatId)
-            SeatHoldRedisHoldResult.LIMIT_EXCEEDED -> throw UserHoldLimitExceededException(command.scheduleId, command.userId)
-        }
-    }
-
-    suspend fun release(command: SeatHoldReleaseCommand) {
-        when (
-            val released = seatHoldRedisRepository.release(
+        return when (seatHoldRedisRepository.toggle(result, Duration.ofSeconds(holdTtlSeconds))) {
+            SeatHoldRedisToggleResult.HELD_CREATED -> SeatHoldToggleResult(
+                holdId = result.holdId,
+                scheduleId = result.scheduleId,
+                seatId = result.seatId,
+                userId = result.userId,
+                status = SeatHoldToggleStatus.HELD,
+                expiresAt = result.expiresAt,
+            )
+            SeatHoldRedisToggleResult.HELD_RELEASED -> SeatHoldToggleResult(
+                holdId = null,
                 scheduleId = command.scheduleId,
                 seatId = command.seatId,
                 userId = command.userId,
+                status = SeatHoldToggleStatus.RELEASED,
+                expiresAt = null,
             )
-        ) {
-            is SeatHoldRedisReleaseResult.Released -> {
-                val now = Instant.now()
-                val event = SeatHoldEvent(
-                    eventId = UUID.randomUUID().toString(),
-                    eventType = SeatHoldEventType.SEAT_HOLD_RELEASED,
-                    holdId = released.holdId,
-                    scheduleId = command.scheduleId,
-                    seatId = command.seatId,
-                    userId = command.userId,
-                    expiresAt = null,
-                    occurredAt = now,
-                )
-                publish(event)
-            }
-            SeatHoldRedisReleaseResult.Noop -> Unit
-            SeatHoldRedisReleaseResult.Denied ->
-                throw SeatHoldReleaseNotAllowedException(command.scheduleId, command.seatId)
+            SeatHoldRedisToggleResult.SOLD -> throw SeatAlreadySoldException(command.scheduleId, command.seatId)
+            SeatHoldRedisToggleResult.HELD_BY_ANOTHER_USER -> throw SeatAlreadyHeldException(command.scheduleId, command.seatId)
+            SeatHoldRedisToggleResult.LIMIT_EXCEEDED -> throw UserHoldLimitExceededException(command.scheduleId, command.userId)
         }
+    }
+
+    suspend fun confirm(command: SeatHoldConfirmCommand): SeatHoldConfirmResult {
+        val activeHolds = seatHoldRedisRepository.findActiveHolds(command.scheduleId, command.userId)
+        if (activeHolds.isEmpty()) {
+            throw NoSeatHoldsToConfirmException(command.scheduleId, command.userId)
+        }
+
+        val confirmationId = UUID.randomUUID().toString()
+        val now = Instant.now()
+        val result = SeatHoldConfirmResult(
+            confirmationId = confirmationId,
+            scheduleId = command.scheduleId,
+            seatIds = activeHolds.map { it.seatId }.sorted(),
+            userId = command.userId,
+            occurredAt = now,
+        )
+        publish(
+            SeatHoldEvent.confirmed(
+                confirmationId = confirmationId,
+                scheduleId = command.scheduleId,
+                seatIds = result.seatIds,
+                userId = command.userId,
+                occurredAt = now,
+            ),
+        )
+
+        return result
     }
 
     private suspend fun publish(event: SeatHoldEvent) {
@@ -76,13 +86,14 @@ class SeatHoldService(
             seatHoldEventProducer.publish(event)
         } catch (error: Exception) {
             log.error(
-                "Failed to publish seat hold event. eventType={}, scheduleId={}, seatId={}, userId={}",
+                "Failed to publish seat hold event. eventType={}, scheduleId={}, seatIds={}, userId={}",
                 event.eventType,
                 event.scheduleId,
-                event.seatId,
+                event.seatIds,
                 event.userId,
                 error,
             )
+            throw error
         }
     }
 }
