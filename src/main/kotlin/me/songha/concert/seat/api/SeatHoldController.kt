@@ -1,69 +1,72 @@
 package me.songha.concert.seat.api
 
-import me.songha.concert.seat.api.request.SeatHoldRequest
-import me.songha.concert.seat.api.response.SeatHoldResponse
+import me.songha.concert.seat.api.auth.AuthenticatedUser
+import me.songha.concert.seat.api.dto.SeatHoldConfirmResponse
+import me.songha.concert.seat.api.dto.SeatHoldToggleResponse
 import me.songha.concert.seat.application.SeatHoldCommand
-import me.songha.concert.seat.application.SeatHoldReleaseCommand
+import me.songha.concert.seat.application.SeatHoldConfirmCommand
 import me.songha.concert.seat.application.SeatHoldService
+import me.songha.concert.seat.application.SeatHoldToggleStatus
 import org.springframework.http.HttpStatus
-import org.springframework.web.bind.annotation.DeleteMapping
-import org.springframework.web.bind.annotation.PathVariable
-import org.springframework.web.bind.annotation.PostMapping
-import org.springframework.web.bind.annotation.RequestBody
-import org.springframework.web.bind.annotation.RequestMapping
-import org.springframework.web.bind.annotation.RequestParam
-import org.springframework.web.bind.annotation.ResponseStatus
-import org.springframework.web.bind.annotation.RestController
-import reactor.core.publisher.Mono
+import org.springframework.http.ResponseEntity
+import org.springframework.web.bind.annotation.*
 
 @RestController
-@RequestMapping("/venues/{venueId}/seats/{seatId}/holds")
+@RequestMapping("/schedules/{scheduleId}")
 class SeatHoldController(
     private val seatHoldService: SeatHoldService,
 ) {
-    @PostMapping
-    @ResponseStatus(HttpStatus.CREATED)
-    fun hold(
+    @PostMapping("/seats/{seatId}/holds")
+    suspend fun toggle(
         @PathVariable
-        venueId: String,
+        scheduleId: String,
         @PathVariable
         seatId: String,
-        @RequestBody request: SeatHoldRequest,
-    ): Mono<SeatHoldResponse> =
-        seatHoldService.hold(
+        authenticatedUser: AuthenticatedUser,
+    ): ResponseEntity<SeatHoldToggleResponse> =
+        seatHoldService.toggle(
             SeatHoldCommand(
-                venueId = venueId,
+                scheduleId = scheduleId,
                 seatId = seatId,
-                userId = request.userId,
+                userId = authenticatedUser.id,
             ),
-        ).map {
-            SeatHoldResponse(
-                holdId = it.holdId,
-                venueId = it.venueId,
-                seatId = it.seatId,
-                userId = it.userId,
-                expiresAt = it.expiresAt,
+        ).let {
+            val status = if (it.status == SeatHoldToggleStatus.HELD) {
+                HttpStatus.CREATED
+            } else {
+                HttpStatus.OK
+            }
+
+            ResponseEntity.status(status).body(
+                SeatHoldToggleResponse(
+                    holdId = it.holdId,
+                    scheduleId = it.scheduleId,
+                    seatId = it.seatId,
+                    userId = it.userId,
+                    status = it.status,
+                    expiresAt = it.expiresAt,
+                ),
             )
         }
 
-    @DeleteMapping("/{holdId}")
-    @ResponseStatus(HttpStatus.NO_CONTENT)
-    fun release(
+    @PostMapping("/holds/confirm")
+    suspend fun confirm(
         @PathVariable
-        venueId: String,
-        @PathVariable
-        seatId: String,
-        @PathVariable
-        holdId: String,
-        @RequestParam
-        userId: String,
-    ): Mono<Unit> =
-        seatHoldService.release(
-            SeatHoldReleaseCommand(
-                venueId = venueId,
-                seatId = seatId,
-                holdId = holdId,
-                userId = userId,
+        scheduleId: String,
+        authenticatedUser: AuthenticatedUser,
+    ): SeatHoldConfirmResponse =
+        seatHoldService.confirm(
+            SeatHoldConfirmCommand(
+                scheduleId = scheduleId,
+                userId = authenticatedUser.id,
             ),
-        )
+        ).let {
+            SeatHoldConfirmResponse(
+                confirmationId = it.confirmationId,
+                scheduleId = it.scheduleId,
+                seatIds = it.seatIds,
+                userId = it.userId,
+                occurredAt = it.occurredAt,
+            )
+        }
 }

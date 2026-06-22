@@ -1,101 +1,99 @@
 package me.songha.concert.seat.application
 
+import me.songha.concert.seat.infrastructure.kafka.SeatHoldEvent
+import me.songha.concert.seat.infrastructure.kafka.SeatHoldEventProducer
 import me.songha.concert.seat.infrastructure.redis.SeatHoldRedisRepository
-import org.redisson.api.RedissonReactiveClient
+import me.songha.concert.seat.infrastructure.redis.SeatHoldRedisToggleResult
+import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.stereotype.Service
-import reactor.core.publisher.Mono
 import java.time.Duration
 import java.time.Instant
 import java.util.UUID
-import java.util.concurrent.TimeUnit
 
 @Service
 class SeatHoldService(
-    private val redissonClient: RedissonReactiveClient,
     private val seatHoldRedisRepository: SeatHoldRedisRepository,
+    private val seatHoldEventProducer: SeatHoldEventProducer,
     @Value("\${seat-holding.hold-ttl-seconds}") private val holdTtlSeconds: Long,
-    @Value("\${seat-holding.lock-wait-seconds}") private val lockWaitSeconds: Long,
-    @Value("\${seat-holding.lock-lease-seconds}") private val lockLeaseSeconds: Long,
 ) {
-    fun hold(command: SeatHoldCommand): Mono<SeatHoldResult> {
+    private val log = LoggerFactory.getLogger(javaClass)
+
+    suspend fun toggle(command: SeatHoldCommand): SeatHoldToggleResult {
         val now = Instant.now()
         val result = SeatHoldResult(
             holdId = UUID.randomUUID().toString(),
-            venueId = command.venueId,
+            scheduleId = command.scheduleId,
             seatId = command.seatId,
             userId = command.userId,
             expiresAt = now.plusSeconds(holdTtlSeconds),
             occurredAt = now,
         )
-        val lock = redissonClient.getLock(lockKey(command.venueId, command.seatId))
 
-        return lock.tryLock(lockWaitSeconds, lockLeaseSeconds, TimeUnit.SECONDS)
-            .flatMap { locked ->
-                if (!locked) {
-                    Mono.error(SeatHoldLockUnavailableException(command.venueId, command.seatId))
-                } else {
-                    seatHoldRedisRepository.holdIfAbsent(result, Duration.ofSeconds(holdTtlSeconds))
-                        .flatMap { created ->
-                            if (created) Mono.just(result)
-                            else Mono.error(SeatAlreadyHeldException(command.venueId, command.seatId))
-                        }
-                        .flatMap { createdResult ->
-                            lock.unlock()
-                                .onErrorResume { Mono.empty() }
-                                .thenReturn(createdResult)
-                        }
-                        .onErrorResume { error ->
-                            lock.unlock()
-                                .onErrorResume { Mono.empty() }
-                                .then(Mono.error(error))
-                        }
-                }
-            }
+        return when (seatHoldRedisRepository.toggle(result, Duration.ofSeconds(holdTtlSeconds))) {
+            SeatHoldRedisToggleResult.HELD_CREATED -> SeatHoldToggleResult(
+                holdId = result.holdId,
+                scheduleId = result.scheduleId,
+                seatId = result.seatId,
+                userId = result.userId,
+                status = SeatHoldToggleStatus.HELD,
+                expiresAt = result.expiresAt,
+            )
+            SeatHoldRedisToggleResult.HELD_RELEASED -> SeatHoldToggleResult(
+                holdId = null,
+                scheduleId = command.scheduleId,
+                seatId = command.seatId,
+                userId = command.userId,
+                status = SeatHoldToggleStatus.RELEASED,
+                expiresAt = null,
+            )
+            SeatHoldRedisToggleResult.SOLD -> throw SeatAlreadySoldException(command.scheduleId, command.seatId)
+            SeatHoldRedisToggleResult.HELD_BY_ANOTHER_USER -> throw SeatAlreadyHeldException(command.scheduleId, command.seatId)
+            SeatHoldRedisToggleResult.LIMIT_EXCEEDED -> throw UserHoldLimitExceededException(command.scheduleId, command.userId)
+        }
     }
 
-    fun release(command: SeatHoldReleaseCommand): Mono<Unit> =
-        seatHoldRedisRepository.releaseIfOwner(
-            venueId = command.venueId,
-            seatId = command.seatId,
-            holdId = command.holdId,
-            userId = command.userId,
-        ).flatMap { released ->
-            if (released) Mono.just(Unit)
-            else Mono.error(SeatHoldReleaseNotAllowedException(command.venueId, command.seatId, command.holdId))
+    suspend fun confirm(command: SeatHoldConfirmCommand): SeatHoldConfirmResult {
+        val activeHolds = seatHoldRedisRepository.findActiveHolds(command.scheduleId, command.userId)
+        if (activeHolds.isEmpty()) {
+            throw NoSeatHoldsToConfirmException(command.scheduleId, command.userId)
         }
 
-    private fun lockKey(venueId: String, seatId: String): String =
-        "lock:venue:$venueId:seat:$seatId"
+        val confirmationId = UUID.randomUUID().toString()
+        val now = Instant.now()
+        val result = SeatHoldConfirmResult(
+            confirmationId = confirmationId,
+            scheduleId = command.scheduleId,
+            seatIds = activeHolds.map { it.seatId }.sorted(),
+            userId = command.userId,
+            occurredAt = now,
+        )
+        publish(
+            SeatHoldEvent.confirmed(
+                confirmationId = confirmationId,
+                scheduleId = command.scheduleId,
+                seatIds = result.seatIds,
+                userId = command.userId,
+                occurredAt = now,
+            ),
+        )
+
+        return result
+    }
+
+    private suspend fun publish(event: SeatHoldEvent) {
+        try {
+            seatHoldEventProducer.publish(event)
+        } catch (error: Exception) {
+            log.error(
+                "Failed to publish seat hold event. eventType={}, scheduleId={}, seatIds={}, userId={}",
+                event.eventType,
+                event.scheduleId,
+                event.seatIds,
+                event.userId,
+                error,
+            )
+            throw error
+        }
+    }
 }
-
-data class SeatHoldCommand(
-    val venueId: String,
-    val seatId: String,
-    val userId: String,
-)
-
-data class SeatHoldReleaseCommand(
-    val venueId: String,
-    val seatId: String,
-    val holdId: String,
-    val userId: String,
-)
-
-data class SeatHoldResult(
-    val holdId: String,
-    val venueId: String,
-    val seatId: String,
-    val userId: String,
-    val expiresAt: Instant,
-    val occurredAt: Instant,
-)
-
-class SeatAlreadyHeldException(venueId: String, seatId: String) :
-    RuntimeException("Seat is already held. venueId=$venueId, seatId=$seatId")
-
-class SeatHoldLockUnavailableException(venueId: String, seatId: String) :
-    RuntimeException("Seat hold is already in progress. venueId=$venueId, seatId=$seatId")
-
-class SeatHoldReleaseNotAllowedException(venueId: String, seatId: String, holdId: String) :
-    RuntimeException("Seat hold release is not allowed. venueId=$venueId, seatId=$seatId, holdId=$holdId")

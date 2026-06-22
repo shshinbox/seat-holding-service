@@ -1,100 +1,125 @@
 package me.songha.concert.seat.infrastructure.redis
 
 import me.songha.concert.seat.application.SeatHoldResult
-import me.songha.concert.seat.infrastructure.kafka.SeatHoldEvent
-import me.songha.concert.seat.infrastructure.kafka.SeatHoldEventType
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.data.redis.core.ReactiveStringRedisTemplate
 import org.springframework.data.redis.core.script.RedisScript
 import org.springframework.stereotype.Repository
-import reactor.core.publisher.Mono
+import kotlinx.coroutines.reactor.awaitSingle
 import tools.jackson.databind.ObjectMapper
 import java.time.Duration
-import java.util.UUID
 
 @Repository
 class SeatHoldRedisRepository(
     private val redisTemplate: ReactiveStringRedisTemplate,
     private val objectMapper: ObjectMapper,
-    @Value("\${seat-holding.outbox.pending-key}") private val outboxPendingKey: String,
+    @Value("\${seat-holding.max-holds-per-user}") private val maxHoldsPerUser: Int,
 ) {
-    private val holdScript = RedisScript.of(
+    private val toggleScript = RedisScript.of(
         """
         if redis.call('EXISTS', KEYS[1]) == 1 then
-          return 0
+          return 'SOLD'
         end
-        redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
-        redis.call('LPUSH', KEYS[2], ARGV[3])
-        return 1
+        
+        local current = redis.call('GET', KEYS[2])
+        if current then
+          local hold = cjson.decode(current)
+          if hold.userId == ARGV[2] then
+            redis.call('DEL', KEYS[2])
+            redis.call('SREM', KEYS[3], ARGV[3])
+            return 'HELD_RELEASED'
+          end
+          return 'HELD'
+        end
+        
+        local heldSeatIds = redis.call('SMEMBERS', KEYS[3])
+        local activeHoldCount = 0
+        for _, heldSeatId in ipairs(heldSeatIds) do
+          local activeHoldKey = 'seat:hold:{' .. ARGV[1] .. '}:' .. heldSeatId
+          if redis.call('EXISTS', activeHoldKey) == 1 then
+            activeHoldCount = activeHoldCount + 1
+          else
+            redis.call('SREM', KEYS[3], heldSeatId)
+          end
+        end
+        
+        if activeHoldCount >= tonumber(ARGV[5]) then
+          return 'LIMIT_EXCEEDED'
+        end
+        
+        redis.call('SET', KEYS[2], ARGV[4], 'EX', ARGV[6])
+        redis.call('SADD', KEYS[3], ARGV[3])
+        redis.call('EXPIRE', KEYS[3], ARGV[6])
+        return 'HELD_CREATED'
         """.trimIndent(),
-        Long::class.java,
+        String::class.java,
     )
-    private val releaseScript = RedisScript.of(
+    private val activeHoldsScript = RedisScript.of(
         """
-        local current = redis.call('GET', KEYS[1])
-        if not current then
-          return 0
+        local heldSeatIds = redis.call('SMEMBERS', KEYS[1])
+        local activeHolds = {}
+        
+        for _, heldSeatId in ipairs(heldSeatIds) do
+          local activeHoldKey = 'seat:hold:{' .. ARGV[1] .. '}:' .. heldSeatId
+          local current = redis.call('GET', activeHoldKey)
+          if current then
+            local hold = cjson.decode(current)
+            if hold.userId == ARGV[2] then
+              table.insert(activeHolds, hold)
+            else
+              redis.call('SREM', KEYS[1], heldSeatId)
+            end
+          else
+            redis.call('SREM', KEYS[1], heldSeatId)
+          end
         end
-        local hold = cjson.decode(current)
-        if hold.holdId ~= ARGV[1] or hold.userId ~= ARGV[2] then
-          return 0
-        end
-        redis.call('DEL', KEYS[1])
-        redis.call('LPUSH', KEYS[2], ARGV[3])
-        return 1
+        
+        return cjson.encode(activeHolds)
         """.trimIndent(),
-        Long::class.java,
+        String::class.java,
     )
-
-    fun holdIfAbsent(result: SeatHoldResult, ttl: Duration): Mono<Boolean> {
+    suspend fun toggle(result: SeatHoldResult, ttl: Duration): SeatHoldRedisToggleResult {
         val holdJson = objectMapper.writeValueAsString(result)
-        val eventJson = objectMapper.writeValueAsString(result.toEvent())
 
         return redisTemplate.execute(
-            holdScript,
-            listOf(holdKey(result.venueId, result.seatId), outboxPendingKey),
-            listOf(holdJson, ttl.seconds.toString(), eventJson),
-        ).next().map { it == 1L }
-    }
-
-    fun releaseIfOwner(
-        venueId: String,
-        seatId: String,
-        holdId: String,
-        userId: String,
-    ): Mono<Boolean> {
-        val eventJson = objectMapper.writeValueAsString(
-            SeatHoldEvent(
-                eventId = UUID.randomUUID().toString(),
-                eventType = SeatHoldEventType.SEAT_HOLD_RELEASED,
-                holdId = holdId,
-                venueId = venueId,
-                seatId = seatId,
-                userId = userId,
-                expiresAt = null,
-                occurredAt = java.time.Instant.now(),
+            toggleScript,
+            listOf(
+                soldKey(result.scheduleId, result.seatId),
+                holdKey(result.scheduleId, result.seatId),
+                userHoldsKey(result.scheduleId, result.userId),
             ),
-        )
-
-        return redisTemplate.execute(
-            releaseScript,
-            listOf(holdKey(venueId, seatId), outboxPendingKey),
-            listOf(holdId, userId, eventJson),
-        ).next().map { it == 1L }
+            listOf(
+                result.scheduleId,
+                result.userId,
+                result.seatId,
+                holdJson,
+                maxHoldsPerUser.toString(),
+                ttl.seconds.toString(),
+            ),
+        ).next().map {
+            when (it) {
+                "HELD" -> SeatHoldRedisToggleResult.HELD_BY_ANOTHER_USER
+                else -> SeatHoldRedisToggleResult.valueOf(it)
+            }
+        }.awaitSingle()
     }
 
-    private fun holdKey(venueId: String, seatId: String): String =
-        "hold:venue:$venueId:seat:$seatId"
+    suspend fun findActiveHolds(scheduleId: String, userId: String): List<SeatHoldResult> {
+        val json = redisTemplate.execute(
+            activeHoldsScript,
+            listOf(userHoldsKey(scheduleId, userId)),
+            listOf(scheduleId, userId),
+        ).next().awaitSingle()
 
-    private fun SeatHoldResult.toEvent(): SeatHoldEvent =
-        SeatHoldEvent(
-            eventId = UUID.randomUUID().toString(),
-            eventType = SeatHoldEventType.SEAT_HELD,
-            holdId = holdId,
-            venueId = venueId,
-            seatId = seatId,
-            userId = userId,
-            expiresAt = expiresAt,
-            occurredAt = occurredAt,
-        )
+        return objectMapper.readValue(json, Array<SeatHoldResult>::class.java).toList()
+    }
+
+    private fun soldKey(scheduleId: String, seatId: String): String =
+        "seat:sold:{$scheduleId}:$seatId"
+
+    private fun holdKey(scheduleId: String, seatId: String): String =
+        "seat:hold:{$scheduleId}:$seatId"
+
+    private fun userHoldsKey(scheduleId: String, userId: String): String =
+        "user:holds:{$scheduleId}:$userId"
 }

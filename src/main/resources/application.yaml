@@ -15,11 +15,6 @@ spring:
 
 seat-holding:
   hold-ttl-seconds: 600
-  lock-wait-seconds: 1
-  lock-lease-seconds: 3
+  max-holds-per-user: 4
   kafka:
     topic: seat-hold-events
-  outbox:
-    pending-key: seat-holding:outbox:pending
-    processing-key: seat-holding:outbox:processing
-    poll-delay-ms: 1000
