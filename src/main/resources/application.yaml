@@ -18,3 +18,11 @@ seat-holding:
   max-holds-per-user: 4
   kafka:
     topic: seat-hold-events
+
+waiting-queue:
+  base-url: http://localhost:8080
+  token:
+    secret: "${WAITING_TOKEN_SECRET:0123456789abcdef0123456789abcdef}"
+
+server:
+  port: 8081

@@ -12,7 +12,7 @@ import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
 
 @RestController
-@RequestMapping("/schedules/{scheduleId}")
+@RequestMapping("/api/v1/holding/schedule/{scheduleId}")
 class SeatHoldController(
     private val seatHoldService: SeatHoldService,
 ) {

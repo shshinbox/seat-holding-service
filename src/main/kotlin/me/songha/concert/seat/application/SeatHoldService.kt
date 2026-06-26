@@ -9,7 +9,7 @@ import org.springframework.beans.factory.annotation.Value
 import org.springframework.stereotype.Service
 import java.time.Duration
 import java.time.Instant
-import java.util.UUID
+import java.util.*
 
 @Service
 class SeatHoldService(
@@ -39,6 +39,7 @@ class SeatHoldService(
                 status = SeatHoldToggleStatus.HELD,
                 expiresAt = result.expiresAt,
             )
+
             SeatHoldRedisToggleResult.HELD_RELEASED -> SeatHoldToggleResult(
                 holdId = null,
                 scheduleId = command.scheduleId,
@@ -47,9 +48,17 @@ class SeatHoldService(
                 status = SeatHoldToggleStatus.RELEASED,
                 expiresAt = null,
             )
+
             SeatHoldRedisToggleResult.SOLD -> throw SeatAlreadySoldException(command.scheduleId, command.seatId)
-            SeatHoldRedisToggleResult.HELD_BY_ANOTHER_USER -> throw SeatAlreadyHeldException(command.scheduleId, command.seatId)
-            SeatHoldRedisToggleResult.LIMIT_EXCEEDED -> throw UserHoldLimitExceededException(command.scheduleId, command.userId)
+            SeatHoldRedisToggleResult.HELD_BY_ANOTHER_USER -> throw SeatAlreadyHeldException(
+                command.scheduleId,
+                command.seatId
+            )
+
+            SeatHoldRedisToggleResult.LIMIT_EXCEEDED -> throw UserHoldLimitExceededException(
+                command.scheduleId,
+                command.userId
+            )
         }
     }
 
